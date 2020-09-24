@@ -7,7 +7,7 @@ be perfectly valid to just have a single function that runs the entire thing.
 
 Required env vars:
 
-    SSH_HOSTNAME
+    SSH_HOST
     SSH_USERNAME
     SSH_PASSWORD or SSH_PRIVATE_KEY (S3 file path in 'bucket:key' format)
 
@@ -16,9 +16,6 @@ Optional env vars
     SSH_PORT - defaults to 22
     SSH_DIR - if specified the SFTP client will transfer the files to the
         specified directory.
-    SSH_FILENAME - used as a mask for the remote filename. Supports three
-        string replacement vars - {bucket}, {key}, {current_date}. Bucket
-        and key refer to the uploaded S3 file. Current date is in ISO format.
 
 """
 import datetime
@@ -44,8 +41,6 @@ assert SSH_PASSWORD or SSH_PRIVATE_KEY, "Missing SSH_PASSWORD or SSH_PRIVATE_KEY
 # optional
 SSH_PORT = int(os.getenv('SSH_PORT', 22))
 SSH_DIR = os.getenv('SSH_DIR')
-# filename mask used for the remote file
-SSH_FILENAME = os.getenv('SSH_FILENAME', 'data_{current_date}')
 
 
 def on_trigger_event(event, context):
@@ -96,18 +91,14 @@ def on_trigger_event(event, context):
 
     with transport:
         for s3_file in s3_files(event):
-            filename = sftp_filename(SSH_FILENAME, s3_file)
             bucket = s3_file.bucket_name
             contents = ''
             try:
                 logger.info(f"S3-SFTP: Transferring S3 file '{s3_file.key}'")
-                transfer_file(sftp_client, s3_file, filename)
+                transfer_file(sftp_client, s3_file)
             except botocore.exceptions.BotoCoreError as ex:
                 logger.exception(f"S3-SFTP: Error transferring S3 file '{s3_file.key}'.")
                 contents = str(ex)
-                filename = filename + '.x'
-            logger.info(f"S3-SFTP: Archiving S3 file '{s3_file.key}'.")
-            archive_file(bucket=bucket, filename=filename, contents=contents)
             logger.info(f"S3-SFTP: Deleting S3 file '{s3_file.key}'.")
             delete_file(s3_file)
 
@@ -163,31 +154,21 @@ def s3_files(event):
             logger.warning(f"S3-SFTP: Ignoring invalid event: { record }")
 
 
-def sftp_filename(file_mask, s3_file):
-    """Create destination SFTP filename."""
-    return file_mask.format(
-        bucket=s3_file.bucket_name,
-        key=s3_file.key.replace("_000", ""),
-        current_date=datetime.date.today().isoformat()
-    )
-
-
-def transfer_file(sftp_client, s3_file, filename):
+def transfer_file(sftp_client, s3_file):
     """
     Transfer S3 file to SFTP server.
 
     Args:
         sftp_client: paramiko.SFTPClient, connected to SFTP endpoint
         s3_file: boto3.Object representing the S3 file
-        filename: string, the remote filename to use
 
     Returns a 2-tuple containing the name of the remote file as transferred,
         and any status message to be written to the archive file.
 
     """
-    with sftp_client.file(filename, 'w') as sftp_file:
+    with sftp_client.file(s3_file.key, 'w') as sftp_file:
         s3_file.download_fileobj(Fileobj=sftp_file)
-    logger.info(f"S3-SFTP: Transferred '{ s3_file.key }' from S3 to SFTP as '{ filename }'")
+    logger.info(f"S3-SFTP: Transferred '{ s3_file.key }' from S3 to SFTP as '{ s3_file.key }'")
 
 
 def delete_file(s3_file):
@@ -208,28 +189,3 @@ def delete_file(s3_file):
         logger.exception(f"S3-SFTP: Error deleting '{ s3_file.key }' from S3.")
     else:
         logger.info(f"S3-SFTP: Deleted '{ s3_file.key }' from S3")
-
-
-def archive_file(*, bucket, filename, contents):
-    """
-    Write to S3 an archive file.
-
-    The archive does **not** contain the file that was sent, as we don't
-    want the data hanging around on S3. Instead it's just an empty marker
-    that represents the file. If the transfer errored, then the archive file
-    has a '.x' suffix, and will contain the error message.
-
-    Args:
-        bucket: string, S3 bucket name
-        filename: string, the name of the archive file
-        contents: string, the contents of the archive file - blank unless there
-            was an exception, in which case the exception message.
-
-    """
-    key = 'archive/{}'.format(filename)
-    try:
-        boto3.resource('s3').Object(bucket, key).put(Body=contents)
-    except botocore.exceptions.BotoCoreError as ex:
-        logger.exception(f"S3-SFTP: Error archiving '{ filename }' as '{ key }'.")
-    else:
-        logger.info(f"S3-SFTP: Archived '{ filename }' as '{ key }'.")
